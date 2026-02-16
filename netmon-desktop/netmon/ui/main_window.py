@@ -1,6 +1,7 @@
 """Main window for NetMon application."""
 
 import csv
+import logging
 import statistics
 from collections import deque
 from PySide6.QtWidgets import (
@@ -11,17 +12,22 @@ from PySide6.QtWidgets import (
     QPushButton,
     QLabel,
     QFrame,
+    QLineEdit,
+    QListWidget,
     QComboBox,
-    QTableWidget,
-    QTableWidgetItem,
+    QTableView,
     QHeaderView,
     QGroupBox,
     QFileDialog,
+    QCheckBox,
 )
-from PySide6.QtCore import Qt, QTimer, QThreadPool
+from PySide6.QtCore import Qt, QSortFilterProxyModel
 from PySide6.QtGui import QCloseEvent
 from netmon.collector import Collector, FakeCollectorAdapter
-from netmon.workers import SampleWorker
+from netmon.scheduler import MultiHostScheduler
+from netmon.ui.measurement_model import MeasurementModel
+
+logger = logging.getLogger(__name__)
 
 
 class MainWindow(QMainWindow):
@@ -29,68 +35,69 @@ class MainWindow(QMainWindow):
 
     def __init__(self, collector: Collector | None = None):
         super().__init__()
-        self.setWindowTitle("NetMon")
+        self.setWindowTitle("NetMon - Multi-Host Monitor")
         self.setGeometry(100, 100, 1000, 700)
 
         # Initialize collector
-        self.collector = collector if collector is not None else FakeCollectorAdapter()
+        collector = collector if collector is not None else FakeCollectorAdapter()
 
-        # Initialize monitoring state
-        self.is_monitoring = False
-
-        # Timer for regular sampling
-        self.timer = QTimer()
-        self.timer.timeout.connect(self.collect_sample)
-
-        # Sampling interval configuration - single source of truth
+        # Sampling interval configuration
         self.INTERVAL_OPTIONS = {"200 ms": 200, "500 ms": 500, "1000 ms": 1000, "2000 ms": 2000}
         self.DEFAULT_INTERVAL_TEXT = "1000 ms"
         self.sample_interval_ms = self.INTERVAL_OPTIONS[self.DEFAULT_INTERVAL_TEXT]
-        
-        # Threading for non-blocking sampling
-        self.thread_pool = QThreadPool.globalInstance()
-        self._in_flight = False
-        self._current_worker = None  # Track current worker for cleanup
 
-        # Data storage (keep last N samples)
+        # Initialize scheduler (centralized multi-host scheduler)
+        self.scheduler = MultiHostScheduler(
+            collector=collector,
+            interval_ms=self.sample_interval_ms,
+            max_concurrent=4,  # Global concurrency limit
+        )
+        self.scheduler.sample_ready.connect(self.on_sample_ready)
+        self.scheduler.error.connect(self.on_sample_error)
+
+        # Data storage
         self.max_table_rows = 300
-        self.measurements = deque(maxlen=self.max_table_rows)
+        self.measurement_model = MeasurementModel(max_rows=self.max_table_rows)
+        
+        # Proxy model for filtering and sorting
+        self.proxy_model = QSortFilterProxyModel()
+        self.proxy_model.setSourceModel(self.measurement_model)
+        self.proxy_model.setFilterKeyColumn(1)  # Filter on Host column (index 1)
+        self.proxy_model.setFilterCaseSensitivity(Qt.CaseInsensitive)
 
-        # Statistics tracking
-        self.recent_latencies = deque(maxlen=30)  # For jitter calculation
-        self.recent_samples = deque(maxlen=50)  # For loss calculation
-
-        # Table state tracking
-        self._table_initialized = False
-
-        # Cached strings to reduce allocations in hot path
-        self._loss_yes = "Yes"
-        self._loss_no = "No"
-        self._loss_dash = "--"
+        # Per-host statistics tracking (keyed by host)
+        self.host_stats = {}  # {host: {latencies: deque, samples: deque}}
+        
+        # Track hosts for filter dropdown
+        self.filter_hosts = set()  # Set of unique hosts
+        
+        # Auto-scroll control ("follow tail" behavior)
+        self.follow_tail = True  # Follow new data by default
+        self._user_disabled_follow_tail = False  # Track explicit user disable
 
         # Set up the main UI
         self.setup_ui()
+        
+        # Add default hosts
+        for host in ["google.com", "cloudflare.com", "8.8.8.8"]:
+            self.scheduler.add_host(host)
+            self.host_list.addItem(host)
+            self.host_stats[host] = {
+                "latencies": deque(maxlen=30),
+                "samples": deque(maxlen=50),
+            }
+            # Add to filter dropdown
+            self.filter_hosts.add(host)
+            self.filter_combo.addItem(host)
 
     def closeEvent(self, event: QCloseEvent) -> None:
         """Handle application close event - clean up resources."""
-        # Stop monitoring and timer
-        if self.timer.isActive():
-            self.timer.stop()
-        self.is_monitoring = False
-        
-        # Clean up any in-flight worker
-        if self._current_worker is not None:
-            try:
-                self._current_worker.signals.sample_ready.disconnect()
-                self._current_worker.signals.error.disconnect() 
-                self._current_worker.signals.finished.disconnect()
-            except RuntimeError:
-                pass  # Already disconnected
-            self._current_worker = None
-        
+        # Stop monitoring via scheduler
+        self.scheduler.stop_monitoring()
+
         # Wait for thread pool to finish (with timeout)
-        self.thread_pool.waitForDone(1000)  # 1 second timeout
-        
+        self.scheduler.thread_pool.waitForDone(1000)  # 1 second timeout
+
         super().closeEvent(event)
 
     def setup_ui(self):
@@ -123,17 +130,34 @@ class MainWindow(QMainWindow):
         title.setStyleSheet("font-weight: bold; font-size: 14px; margin: 10px;")
         layout.addWidget(title)
 
-        # Host selection
-        host_group = QGroupBox("Target Host")
+        # Host list management
+        host_group = QGroupBox("Target Hosts")
         host_layout = QVBoxLayout(host_group)
 
-        self.host_combo = QComboBox()
-        self.host_combo.setEditable(True)
-        self.host_combo.addItems(
-            ["google.com", "cloudflare.com", "8.8.8.8", "1.1.1.1", "github.com"]
-        )
-        self.host_combo.setCurrentText("google.com")
-        host_layout.addWidget(self.host_combo)
+        # Host input
+        input_layout = QHBoxLayout()
+        self.host_input = QLineEdit()
+        self.host_input.setPlaceholderText("Enter host...")
+        self.host_input.returnPressed.connect(self.add_host)
+        input_layout.addWidget(self.host_input)
+        
+        self.add_host_button = QPushButton("+")
+        self.add_host_button.setFixedWidth(30)
+        self.add_host_button.clicked.connect(self.add_host)
+        input_layout.addWidget(self.add_host_button)
+        host_layout.addLayout(input_layout)
+
+        # Host list
+        self.host_list = QListWidget()
+        self.host_list.setMaximumHeight(120)
+        self.host_list.currentItemChanged.connect(self.on_host_selection_changed)
+        host_layout.addWidget(self.host_list)
+        
+        # Remove host button
+        self.remove_host_button = QPushButton("Remove Selected")
+        self.remove_host_button.clicked.connect(self.remove_host)
+        host_layout.addWidget(self.remove_host_button)
+        
         layout.addWidget(host_group)
 
         # Controls
@@ -173,12 +197,21 @@ class MainWindow(QMainWindow):
         interval_layout.addWidget(self.interval_combo)
 
         controls_layout.addLayout(interval_layout)
+        
+        # Concurrency info
+        self.concurrency_label = QLabel("Max jobs: 4")
+        self.concurrency_label.setStyleSheet("font-size: 10px; color: gray;")
+        controls_layout.addWidget(self.concurrency_label)
 
         layout.addWidget(controls_group)
 
-        # Summary statistics
-        stats_group = QGroupBox("Summary Statistics")
+        # Summary statistics (per-host)
+        stats_group = QGroupBox("Statistics")
         stats_layout = QVBoxLayout(stats_group)
+        
+        self.stats_host_label = QLabel("Host: (select one)")
+        self.stats_host_label.setStyleSheet("font-weight: bold; font-size: 10px;")
+        stats_layout.addWidget(self.stats_host_label)
 
         self.latency_label = QLabel("Latency: --")
         self.jitter_label = QLabel("Jitter: --")
@@ -189,6 +222,18 @@ class MainWindow(QMainWindow):
             stats_layout.addWidget(label)
 
         layout.addWidget(stats_group)
+        
+        # View options
+        view_group = QGroupBox("View Options")
+        view_layout = QVBoxLayout(view_group)
+        
+        self.follow_tail_checkbox = QCheckBox("Follow Tail")
+        self.follow_tail_checkbox.setChecked(True)
+        self.follow_tail_checkbox.setToolTip("Auto-scroll to newest data (disabled when sorting)")
+        self.follow_tail_checkbox.stateChanged.connect(self.on_follow_tail_toggled)
+        view_layout.addWidget(self.follow_tail_checkbox)
+        
+        layout.addWidget(view_group)
 
         # Add some spacing
         layout.addStretch()
@@ -213,11 +258,24 @@ class MainWindow(QMainWindow):
         title.setAlignment(Qt.AlignCenter)
         title.setStyleSheet("font-weight: bold; font-size: 14px; margin: 10px;")
         layout.addWidget(title)
+        
+        # Filter controls
+        filter_layout = QHBoxLayout()
+        filter_label = QLabel("Filter by host:")
+        filter_layout.addWidget(filter_label)
+        
+        self.filter_combo = QComboBox()
+        self.filter_combo.addItem("All")
+        self.filter_combo.currentTextChanged.connect(self.on_filter_changed)
+        filter_layout.addWidget(self.filter_combo)
+        filter_layout.addStretch()
+        
+        layout.addLayout(filter_layout)
 
-        # Create table
-        self.table = QTableWidget()
-        self.table.setColumnCount(4)
-        self.table.setHorizontalHeaderLabels(["Time", "Host", "Latency (ms)", "Lost"])
+        # Create table view with proxy model
+        self.table = QTableView()
+        self.table.setModel(self.proxy_model)  # Use proxy, not source model
+        self.table.setSortingEnabled(True)  # Enable sorting by clicking headers
 
         # Configure table appearance
         header = self.table.horizontalHeader()
@@ -227,65 +285,140 @@ class MainWindow(QMainWindow):
         header.setSectionResizeMode(3, QHeaderView.Stretch)  # Lost
 
         self.table.setAlternatingRowColors(True)
-        self.table.setSelectionBehavior(QTableWidget.SelectRows)
-
-        # Initialize with 0 rows for clean append-only behavior
-        self.table.setRowCount(0)
+        self.table.setSelectionBehavior(QTableView.SelectRows)
+        
+        # Connect signals for auto-scroll control
+        scrollbar = self.table.verticalScrollBar()
+        scrollbar.valueChanged.connect(self.on_scrollbar_changed)
+        header.sortIndicatorChanged.connect(self.on_sort_changed)
 
         layout.addWidget(self.table)
 
         return area
 
+    def add_host(self):
+        """Add host from input field to monitoring list."""
+        host = self.host_input.text().strip()
+        if not host:
+            return
+        
+        # Check if already in list
+        if host in [self.host_list.item(i).text() for i in range(self.host_list.count())]:
+            self.status_label.setText(f"Status: Host '{host}' already in list")
+            return
+        
+        # Add to scheduler and UI
+        self.scheduler.add_host(host)
+        self.host_list.addItem(host)
+        
+        # Initialize stats for this host
+        self.host_stats[host] = {
+            "latencies": deque(maxlen=30),
+            "samples": deque(maxlen=50),
+        }
+        
+        # Add to filter dropdown if not already present
+        if host not in self.filter_hosts:
+            self.filter_hosts.add(host)
+            self.filter_combo.addItem(host)
+        
+        # Clear input
+        self.host_input.clear()
+        self.status_label.setText(f"Status: Added '{host}'")
+    
+    def remove_host(self):
+        """Remove selected host from monitoring list."""
+        current_item = self.host_list.currentItem()
+        if not current_item:
+            self.status_label.setText("Status: No host selected")
+            return
+        
+        host = current_item.text()
+        
+        # Remove from scheduler
+        self.scheduler.remove_host(host)
+        
+        # Remove from UI
+        self.host_list.takeItem(self.host_list.row(current_item))
+        
+        # Remove stats
+        self.host_stats.pop(host, None)
+        
+        # Remove from filter dropdown
+        if host in self.filter_hosts:
+            self.filter_hosts.remove(host)
+            index = self.filter_combo.findText(host)
+            if index >= 0:
+                self.filter_combo.removeItem(index)
+        
+        self.status_label.setText(f"Status: Removed '{host}'")
+        
+        # Clear stats display if no host selected
+        if self.host_list.count() == 0:
+            self.stats_host_label.setText("Host: (none)")
+            self.latency_label.setText("Latency: --")
+            self.jitter_label.setText("Jitter: --")
+            self.loss_label.setText("Loss: --")
+    
+    def on_host_selection_changed(self):
+        """Handle host selection change in list - update statistics display."""
+        current_item = self.host_list.currentItem()
+        if current_item:
+            host = current_item.text()
+            self.stats_host_label.setText(f"Host: {host}")
+            self.update_statistics_for_host(host)
+        else:
+            self.stats_host_label.setText("Host: (select one)")
+            self.latency_label.setText("Latency: --")
+            self.jitter_label.setText("Jitter: --")
+            self.loss_label.setText("Loss: --")
+
     def start_monitoring(self):
         """Handle start button click."""
-        self.is_monitoring = True
-        self.start_button.setEnabled(False)
-        self.stop_button.setEnabled(True)
-        self.status_label.setText("Status: Monitoring")
-
-        # Start the timer with current interval
-        self.timer.start(self.sample_interval_ms)
+        if self.scheduler.get_hosts():
+            self.scheduler.start_monitoring()
+            self.start_button.setEnabled(False)
+            self.stop_button.setEnabled(True)
+            num_hosts = len(self.scheduler.get_hosts())
+            self.status_label.setText(f"Status: Monitoring {num_hosts} host(s)")
+        else:
+            self.status_label.setText("Status: No hosts to monitor")
 
     def stop_monitoring(self):
         """Handle stop button click."""
-        self.is_monitoring = False
+        self.scheduler.stop_monitoring()
         self.start_button.setEnabled(True)
         self.stop_button.setEnabled(False)
         self.status_label.setText("Status: Stopped")
-
-        # Stop the timer
-        self.timer.stop()
-        
-        # Note: In-flight workers will complete but their results will be ignored
-        # due to the is_monitoring check in on_sample_ready()
 
     def clear_data(self):
         """Clear all monitoring data and reset UI state.
 
         Keeps monitoring state intact - if running, continues running but with fresh data.
         """
-        # Clear all data collections
-        self.measurements.clear()
-        self.recent_samples.clear()
-        self.recent_latencies.clear()
-
-        # Clear the table
-        self.table.setRowCount(0)
-
-        # Reset statistics labels
-        self.latency_label.setText("Latency: --")
-        self.jitter_label.setText("Jitter: --")
-        self.loss_label.setText("Loss: --")
-
-        # Update status - show cleared but preserve monitoring state
-        if self.is_monitoring:
+        # Clear model
+        self.measurement_model.clear()
+        
+        # Clear per-host statistics
+        for host in self.host_stats:
+            self.host_stats[host]["latencies"].clear()
+            self.host_stats[host]["samples"].clear()
+        
+        # Update statistics display
+        current_item = self.host_list.currentItem()
+        if current_item:
+            self.update_statistics_for_host(current_item.text())
+        
+        # Update status
+        if self.scheduler.is_monitoring:
             self.status_label.setText("Status: Monitoring (Cleared)")
         else:
             self.status_label.setText("Status: Cleared")
 
     def export_csv(self):
         """Export measurements to CSV file."""
-        if not self.measurements:
+        measurements = self.measurement_model.get_measurements()
+        if not measurements:
             self.status_label.setText("Status: No data to export")
             return
 
@@ -311,7 +444,7 @@ class MainWindow(QMainWindow):
                 writer.writerow(["ts_iso", "host", "latency_ms", "loss"])
 
                 # Write measurements in chronological order
-                for measurement in self.measurements:
+                for measurement in measurements:
                     # Format timestamp as ISO string
                     ts_iso = measurement.ts.isoformat()
 
@@ -350,161 +483,203 @@ class MainWindow(QMainWindow):
         # Use robust mapping instead of string parsing
         if text in self.INTERVAL_OPTIONS:
             ms_value = self.INTERVAL_OPTIONS[text]
-            self.set_sample_interval(ms_value)
+            self.scheduler.set_interval(ms_value)
 
-    def set_sample_interval(self, ms: int):
-        """Set the sampling interval and update timer if running."""
-        self.sample_interval_ms = ms
+    def on_sample_ready(self, sample, generation_id, host):
+        """Handle measurement result from scheduler.
 
-        # If timer is currently active, update its interval immediately
-        if self.timer.isActive():
-            self.timer.setInterval(ms)
-
-    def collect_sample(self):
-        """Collect a new measurement sample asynchronously."""
-        if not self.is_monitoring:
-            return
-
-        # Get current host from combo box
-        host = self.host_combo.currentText().strip()
-        if not host:
-            return
-        
-        # Skip if already sampling (bounded concurrency)
-        if self._in_flight:
-            return
-        
-        # Mark as in-flight and start worker
-        self._in_flight = True
-        
-        # Create and configure worker
-        worker = SampleWorker(self.collector, host)
-        worker.signals.sample_ready.connect(self.on_sample_ready)
-        worker.signals.error.connect(self.on_sample_error)
-        worker.signals.finished.connect(self.on_sample_finished)
-        
-        # Track current worker for cleanup
-        self._current_worker = worker
-        
-        # Execute in thread pool
-        self.thread_pool.start(worker)
-    
-    def on_sample_ready(self, sample):
-        """Handle measurement result from worker thread."""
-        # Only process if still monitoring (ignore late results)
-        if not self.is_monitoring:
-            return
-            
-        # Add to our collections
-        self.measurements.append(sample)
-        self.recent_samples.append(sample)
-
-        # Track latencies for jitter calculation (only non-lost samples)
-        if not sample.loss and sample.latency_ms is not None:
-            self.recent_latencies.append(sample.latency_ms)
-
-        # Append only the new sample to table (O(1) operation)
-        self.append_measurement_to_table(sample)
-
-        # Update statistics
-        self.update_statistics()
-    
-    def on_sample_error(self, error_msg):
-        """Handle sampling error from worker thread."""
-        # Log error and update status if still monitoring
-        print(f"Error collecting sample: {error_msg}")
-        if self.is_monitoring:
-            self.status_label.setText(f"Status: Sampling error - {error_msg}")
-    
-    def on_sample_finished(self):
-        """Handle worker completion - clear in-flight flag and cleanup."""
-        # Disconnect signals to prevent memory leaks
-        if self._current_worker is not None:
-            try:
-                self._current_worker.signals.sample_ready.disconnect()
-                self._current_worker.signals.error.disconnect()
-                self._current_worker.signals.finished.disconnect()
-            except RuntimeError:
-                # Signals already disconnected - ignore
-                pass
-            self._current_worker = None
-        
-        self._in_flight = False
-
-    def append_measurement_to_table(self, measurement):
-        """Append a single measurement to the table (O(1) operation).
-
-        This avoids the O(N) cost of redrawing the entire table each tick.
-        Optimized to reduce allocations and improve performance.
+        Args:
+            sample: Measurement object
+            generation_id: Generation ID when worker was scheduled
+            host: Host that was sampled
         """
-        # Insert new row at the end first
-        row_position = self.table.rowCount()
-        self.table.insertRow(row_position)
+        # Add to table model
+        self.measurement_model.append_measurement(sample)
+        
+        # Add host to filter dropdown if new
+        if host not in self.filter_hosts:
+            self.filter_hosts.add(host)
+            self.filter_combo.addItem(host)
+        
+        # Update per-host statistics
+        if host in self.host_stats:
+            self.host_stats[host]["samples"].append(sample)
+            if not sample.loss and sample.latency_ms is not None:
+                self.host_stats[host]["latencies"].append(sample.latency_ms)
+        
+        # Maybe auto-scroll to latest row (if following tail)
+        self.maybe_autoscroll()
+        
+        # Update statistics display if this host is selected
+        current_item = self.host_list.currentItem()
+        if current_item and current_item.text() == host:
+            self.update_statistics_for_host(host)
 
-        # Time column - optimize string formatting
-        time_str = measurement.ts.strftime("%H:%M:%S")
-        time_item = QTableWidgetItem(time_str)
-        time_item.setFlags(time_item.flags() & ~Qt.ItemIsEditable)  # Read-only
-        self.table.setItem(row_position, 0, time_item)
+    def on_sample_error(self, host, error_msg):
+        """Handle sampling error from scheduler.
+        
+        Args:
+            host: Host that had an error
+            error_msg: Error message
+        """
+        logger.error("Sampling error for %s: %s", host, error_msg)
+        if self.scheduler.is_monitoring:
+            self.status_label.setText(f"Status: Error on {host}")
 
-        # Host column
-        host_item = QTableWidgetItem(measurement.host)
-        host_item.setFlags(host_item.flags() & ~Qt.ItemIsEditable)  # Read-only
-        self.table.setItem(row_position, 1, host_item)
-
-        # Latency column (right-aligned) - reduce string allocations
-        if measurement.loss:
-            latency_str = self._loss_dash  # Reuse cached string
+    def on_filter_changed(self, text: str):
+        """Handle filter dropdown selection change.
+        
+        Args:
+            text: Selected filter text ("All" or a hostname)
+        """
+        if text == "All":
+            # Clear filter to show all rows
+            self.proxy_model.setFilterFixedString("")
         else:
-            # More efficient than f-string for this simple case
-            latency_str = f"{measurement.latency_ms:.2f}"
-        latency_item = QTableWidgetItem(latency_str)
-        latency_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        latency_item.setFlags(latency_item.flags() & ~Qt.ItemIsEditable)  # Read-only
-        self.table.setItem(row_position, 2, latency_item)
-
-        # Lost column (centered) - use cached strings
-        lost_str = self._loss_yes if measurement.loss else self._loss_no
-        lost_item = QTableWidgetItem(lost_str)
-        lost_item.setTextAlignment(Qt.AlignCenter)
-        lost_item.setFlags(lost_item.flags() & ~Qt.ItemIsEditable)  # Read-only
-        self.table.setItem(row_position, 3, lost_item)
-
-        # Remove oldest rows if we exceed capacity (no off-by-one issues)
-        while self.table.rowCount() > self.max_table_rows:
-            self.table.removeRow(0)
-
-        # Keep latest row visible
-        self.table.scrollToBottom()
-
-    def update_statistics(self):
-        """Update the summary statistics labels."""
-        if not self.recent_samples:
+            # Filter to show only rows matching the selected host
+            self.proxy_model.setFilterFixedString(text)
+    
+    def update_statistics_for_host(self, host: str):
+        """Update statistics display for a specific host.
+        
+        Args:
+            host: Host to show statistics for
+        """
+        if host not in self.host_stats:
+            self.latency_label.setText("Latency: --")
+            self.jitter_label.setText("Jitter: --")
+            self.loss_label.setText("Loss: --")
             return
-
+        
+        samples = self.host_stats[host]["samples"]
+        latencies = self.host_stats[host]["latencies"]
+        
+        if not samples:
+            self.latency_label.setText("Latency: --")
+            self.jitter_label.setText("Jitter: --")
+            self.loss_label.setText("Loss: --")
+            return
+        
         # Calculate latency (last non-lost sample)
         last_latency = None
-        for sample in reversed(self.recent_samples):
+        for sample in reversed(samples):
             if not sample.loss and sample.latency_ms is not None:
                 last_latency = sample.latency_ms
                 break
-
+        
         if last_latency is not None:
             self.latency_label.setText(f"Latency: {last_latency:.2f} ms")
         else:
             self.latency_label.setText("Latency: -- ms")
-
+        
         # Calculate jitter (standard deviation of recent latencies)
-        if len(self.recent_latencies) >= 2:
-            jitter = statistics.stdev(self.recent_latencies)
+        if len(latencies) >= 2:
+            jitter = statistics.stdev(latencies)
             self.jitter_label.setText(f"Jitter: {jitter:.2f} ms")
         else:
             self.jitter_label.setText("Jitter: -- ms")
-
+        
         # Calculate loss percentage (over recent samples)
-        if len(self.recent_samples) > 0:
-            lost_count = sum(1 for s in self.recent_samples if s.loss)
-            loss_percent = (lost_count / len(self.recent_samples)) * 100
+        if len(samples) > 0:
+            lost_count = sum(1 for s in samples if s.loss)
+            loss_percent = (lost_count / len(samples)) * 100
             self.loss_label.setText(f"Loss: {loss_percent:.1f}%")
         else:
             self.loss_label.setText("Loss: --%")
+    
+    def is_sorting_active(self) -> bool:
+        """Check if table is currently sorted by user.
+        
+        Returns:
+            True if sorting is enabled and a sort column is active
+        """
+        if not self.table.isSortingEnabled():
+            return False
+        
+        header = self.table.horizontalHeader()
+        return header.sortIndicatorSection() >= 0
+    
+    def is_near_bottom(self, threshold: int = 5) -> bool:
+        """Check if scrollbar is near the bottom.
+        
+        Args:
+            threshold: Number of steps from max to consider "near bottom"
+        
+        Returns:
+            True if within threshold steps of bottom
+        """
+        scrollbar = self.table.verticalScrollBar()
+        return (scrollbar.maximum() - scrollbar.value()) <= threshold
+    
+    def maybe_autoscroll(self):
+        """Conditionally scroll to bottom if follow_tail is enabled and appropriate."""
+        if self.follow_tail and not self.is_sorting_active():
+            self.table.scrollToBottom()
+    
+    def on_scrollbar_changed(self, value: int):
+        """Handle scrollbar value changes to detect user scrolling.
+        
+        Args:
+            value: Current scrollbar value
+        """
+        # Ignore if user explicitly disabled follow tail via checkbox
+        if self._user_disabled_follow_tail:
+            return
+        
+        # If user scrolls to near bottom and sorting is inactive, re-enable follow_tail
+        if self.is_near_bottom() and not self.is_sorting_active():
+            if not self.follow_tail:
+                self.follow_tail = True
+                # Block signals to prevent on_follow_tail_toggled from overwriting _user_disabled_follow_tail
+                self.follow_tail_checkbox.blockSignals(True)
+                self.follow_tail_checkbox.setChecked(True)
+                self.follow_tail_checkbox.blockSignals(False)
+        # If user scrolls away from bottom, disable follow_tail
+        elif not self.is_near_bottom():
+            if self.follow_tail:
+                self.follow_tail = False
+                # Block signals to prevent on_follow_tail_toggled from overwriting _user_disabled_follow_tail
+                self.follow_tail_checkbox.blockSignals(True)
+                self.follow_tail_checkbox.setChecked(False)
+                self.follow_tail_checkbox.blockSignals(False)
+    
+    def on_sort_changed(self, column: int, order):
+        """Handle sort indicator changes - disable follow_tail when sorting.
+        
+        Args:
+            column: Column index that was sorted
+            order: Sort order (ascending/descending)
+        """
+        # When user activates sorting, disable follow_tail
+        if self.is_sorting_active():
+            self.follow_tail = False
+            # Block signals to prevent on_follow_tail_toggled from overwriting _user_disabled_follow_tail
+            self.follow_tail_checkbox.blockSignals(True)
+            self.follow_tail_checkbox.setChecked(False)
+            self.follow_tail_checkbox.blockSignals(False)
+    
+    def on_follow_tail_toggled(self, state: int):
+        """Handle Follow Tail checkbox toggle.
+        
+        Args:
+            state: Qt.Checked or Qt.Unchecked
+        """
+        checked = (state == Qt.CheckState.Checked.value)
+        
+        # If user is enabling follow_tail while sorting is active, prevent it
+        if checked and self.is_sorting_active():
+            self.follow_tail = False
+            # Block signals to prevent recursion
+            self.follow_tail_checkbox.blockSignals(True)
+            self.follow_tail_checkbox.setChecked(False)
+            self.follow_tail_checkbox.blockSignals(False)
+            self.status_label.setText("Status: Follow Tail disabled while sorting")
+            return
+        
+        # Update state
+        self.follow_tail = checked
+        self._user_disabled_follow_tail = not checked
+        
+        # If enabling, scroll to bottom immediately
+        if checked:
+            self.maybe_autoscroll()

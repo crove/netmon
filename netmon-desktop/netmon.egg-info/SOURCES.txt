@@ -2,6 +2,12 @@ README.md
 pyproject.toml
 netmon/__init__.py
 netmon/__main__.py
+netmon/collector.py
+netmon/collector_ping.py
+netmon/fake_collector.py
+netmon/logging_config.py
+netmon/models.py
+netmon/workers.py
 netmon.egg-info/PKG-INFO
 netmon.egg-info/SOURCES.txt
 netmon.egg-info/dependency_links.txt
@@ -10,3 +16,7 @@ netmon.egg-info/requires.txt
 netmon.egg-info/top_level.txt
 netmon/ui/__init__.py
 netmon/ui/main_window.py
+tests/test_collector.py
+tests/test_collector_ping.py
+tests/test_models.py
+tests/test_ping_parsing.py
